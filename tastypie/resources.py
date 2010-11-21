@@ -519,7 +519,7 @@ class Resource(object):
     
     # Data preparation.
     
-    def full_dehydrate(self, obj):
+    def full_dehydrate(self, obj, request=None):
         """
         Given an object instance, extract the information from it to populate
         the resource.
@@ -541,10 +541,10 @@ class Resource(object):
             if method:
                 bundle.data[field_name] = method(bundle)
         
-        bundle = self.dehydrate(bundle)
+        bundle = self.dehydrate(bundle, request)
         return bundle
     
-    def dehydrate(self, bundle):
+    def dehydrate(self, bundle, request=None):
         """
         A hook to allow a final manipulation of data once all fields/methods
         have built out the dehydrated data.
@@ -803,7 +803,7 @@ class Resource(object):
         to_be_serialized = paginator.page()
         
         # Dehydrate the bundles in preparation for serialization.
-        to_be_serialized['objects'] = [self.full_dehydrate(obj=obj) for obj in to_be_serialized['objects']]
+        to_be_serialized['objects'] = [self.full_dehydrate(obj=obj, request=request) for obj in to_be_serialized['objects']]
         return self.create_response(request, to_be_serialized)
     
     def get_detail(self, request, **kwargs):
@@ -822,7 +822,7 @@ class Resource(object):
         except MultipleObjectsReturned:
             return HttpMultipleChoices("More than one resource is found at this URI.")
         
-        bundle = self.full_dehydrate(obj)
+        bundle = self.full_dehydrate(obj,request=request)
         return self.create_response(request, bundle)
     
     def put_list(self, request, **kwargs):
@@ -966,7 +966,7 @@ class Resource(object):
         for pk in obj_pks:
             try:
                 obj = self.obj_get(pk=pk)
-                bundle = self.full_dehydrate(obj)
+                bundle = self.full_dehydrate(obj, request=request)
                 objects.append(bundle)
             except ObjectDoesNotExist:
                 not_found.append(pk)
