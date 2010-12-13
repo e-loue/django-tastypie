@@ -2,8 +2,7 @@ from dateutil.parser import parse
 import re
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
-from django.core.urlresolvers import reverse, resolve
-from django.utils import datetime_safe
+from django.utils import datetime_safe, importlib
 from tastypie.bundle import Bundle
 from tastypie.exceptions import ApiFieldError, NotFound
 
@@ -21,8 +20,9 @@ DATETIME_REGEX = re.compile('^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})(T|
 class ApiField(object):
     """The base implementation of a field used by the resources."""
     dehydrated_type = 'string'
+    help_text = ''
     
-    def __init__(self, attribute=None, default=NOT_PROVIDED, null=False, readonly=False, unique=False):
+    def __init__(self, attribute=None, default=NOT_PROVIDED, null=False, readonly=False, unique=False, help_text=None):
         """
         Sets up the field. This is generally called when the containing
         ``Resource`` is initialized.
@@ -41,6 +41,13 @@ class ApiField(object):
         
         Optionally accepts a ``readonly``, which indicates whether the field
         is used during the ``hydrate`` or not. Defaults to ``False``.
+        
+        Optionally accepts a ``unique``, which indicates if the field is a
+        unique identifier for the object.
+        
+        Optionally accepts ``help_text``, which lets you provide a
+        human-readable description of the field exposed at the schema level.
+        Defaults to the per-Field definition.
         """
         # Track what the index thinks this field is called.
         self.instance_name = None
@@ -50,6 +57,9 @@ class ApiField(object):
         self.readonly = readonly
         self.value = None
         self.unique = unique
+        
+        if help_text:
+            self.help_text = help_text
     
     def has_default(self):
         """Returns a boolean of whether this field has a default value."""
@@ -141,6 +151,7 @@ class CharField(ApiField):
     Covers both ``models.CharField`` and ``models.TextField``.
     """
     dehydrated_type = 'string'
+    help_text = 'Unicode string data. Ex: "Hello World"'
     
     def dehydrate(self, obj):
         return self.convert(super(CharField, self).dehydrate(obj))
@@ -159,6 +170,7 @@ class FileField(ApiField):
     Covers both ``models.FileField`` and ``models.ImageField``.
     """
     dehydrated_type = 'string'
+    help_text = 'A file path as a string. Ex: "/tmp/photos/my_photo.jpg"'
     
     def dehydrate(self, obj):
         media_url = settings.MEDIA_URL
@@ -186,6 +198,7 @@ class IntegerField(ApiField):
     ``models.PositiveSmallIntegerField`` and ``models.SmallIntegerField``.
     """
     dehydrated_type = 'integer'
+    help_text = 'Integer data. Ex: 2673'
     
     def dehydrate(self, obj):
         return self.convert(super(IntegerField, self).dehydrate(obj))
@@ -202,6 +215,7 @@ class FloatField(ApiField):
     A floating point field.
     """
     dehydrated_type = 'float'
+    help_text = 'Floating point numeric data. Ex: 26.73'
     
     def dehydrate(self, obj):
         return self.convert(super(FloatField, self).dehydrate(obj))
@@ -220,6 +234,7 @@ class BooleanField(ApiField):
     Covers both ``models.BooleanField`` and ``models.NullBooleanField``.
     """
     dehydrated_type = 'boolean'
+    help_text = 'Boolean data. Ex: True'
     
     def dehydrate(self, obj):
         return self.convert(super(BooleanField, self).dehydrate(obj))
@@ -236,6 +251,7 @@ class DateField(ApiField):
     A date field.
     """
     dehydrated_type = 'date'
+    help_text = 'A date as a string. Ex: "2010-11-10"'
     
     def dehydrate(self, obj):
         return self.convert(super(DateField, self).dehydrate(obj))
@@ -276,6 +292,7 @@ class DateTimeField(ApiField):
     A datetime field.
     """
     dehydrated_type = 'datetime'
+    help_text = 'A date & time as a string. Ex: "2010-11-10T03:07:43"'
     
     def dehydrate(self, obj):
         return self.convert(super(DateTimeField, self).dehydrate(obj))
@@ -327,8 +344,9 @@ class RelatedField(ApiField):
     dehydrated_type = 'related'
     is_related = True
     self_referential = False
+    help_text = 'A related resource. Can be either a URI or set of nested resource data.'
     
-    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False):
+    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False, help_text=None):
         """
         Builds the field and prepares it to access to related data.
         
@@ -361,9 +379,14 @@ class RelatedField(ApiField):
         self.api_name = None
         self.resource_name = None
         self.unique = unique
+        self._to_class = None
         
         if self.to == 'self':
             self.self_referential = True
+            self._to_class = self.__class__
+        
+        if help_text:
+            self.help_text = help_text
     
     def has_default(self):
         """
@@ -383,10 +406,40 @@ class RelatedField(ApiField):
         """
         Instaniates the related resource.
         """
-        related_resource = self.to()
+        related_resource = self.to_class()
         # Try to be efficient about DB queries.
         related_resource.instance = related_instance
         return related_resource
+    
+    @property
+    def to_class(self):
+        # We need to be lazy here, because when the metaclass constructs the
+        # Resources, other classes may not exist yet.
+        # That said, memoize this so we never have to relookup/reimport.
+        if self._to_class:
+            return self._to_class
+        
+        if not isinstance(self.to, basestring):
+            self._to_class = self.to
+            return self._to_class
+        
+        # It's a string. Let's figure it out.
+        if '.' in self.to:
+            # Try to import.
+            module_bits = self.to.split('.')
+            module_path, class_name = '.'.join(module_bits[:-1]), module_bits[-1]
+            module = importlib.import_module(module_path)
+        else:
+            # We've got a bare class name here, which won't work (No AppCache
+            # to rely on). Try to throw a useful error.
+            raise ImportError("Tastypie requires a Python-style path (<module.module.Class>) to lazy load related resources. Only given '%s'." % self.to)
+        
+        self._to_class = getattr(module, class_name, None)
+        
+        if self._to_class is None:
+            raise ImportError("Module '%s' does not appear to have a class called '%s'." % (module_path, class_name))
+        
+        return self._to_class
     
     def dehydrate_related(self, bundle, related_resource):
         """
@@ -407,7 +460,7 @@ class RelatedField(ApiField):
         dictionary-like structure is provided, a fresh resource is
         created.
         """
-        self.fk_resource = self.to()
+        self.fk_resource = self.to_class()
         
         if isinstance(value, basestring):
             # We got a URI. Load the object and assign it.
@@ -442,8 +495,10 @@ class ToOneField(RelatedField):
     
     This subclass requires Django's ORM layer to work properly.
     """
-    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False):
-        super(ToOneField, self).__init__(to, attribute, related_name, null=null, full=full, unique=unique)
+    help_text = 'A single related resource. Can be either a URI or set of nested resource data.'
+    
+    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False, help_text=None):
+        super(ToOneField, self).__init__(to, attribute, related_name, null=null, full=full, unique=unique, help_text=help_text)
         self.fk_resource = None
     
     def dehydrate(self, bundle):
@@ -496,9 +551,10 @@ class ToManyField(RelatedField):
     This is due to the way Django implements M2M relationships.
     """
     is_m2m = True
+    help_text = 'Many related resources. Can be either a list of URIs or list of individually nested resource data.'
     
-    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False):
-        super(ToManyField, self).__init__(to, attribute, related_name, null=null, full=full, unique=unique)
+    def __init__(self, to, attribute, related_name=None, null=False, full=False, unique=False, help_text=help_text):
+        super(ToManyField, self).__init__(to, attribute, related_name, null=null, full=full, unique=unique, help_text=help_text)
         self.m2m_bundles = []
     
     def dehydrate(self, bundle):
@@ -569,10 +625,10 @@ class OneToManyField(ToManyField):
 #   + DateTimeField
 #   - DecimalField
 #   - EmailField
-#   - FileField
-#   - FilePathField
+#   + FileField
+#   + FilePathField
 #   + FloatField
-#   - ImageField
+#   + ImageField
 #   + IntegerField
 #   - IPAddressField
 #   + NullBooleanField
@@ -586,6 +642,6 @@ class OneToManyField(ToManyField):
 #   - XMLField
 #   + ForeignKey
 #   + ManyToManyField
-#   - OneToOneField
+#   + OneToOneField
 
 

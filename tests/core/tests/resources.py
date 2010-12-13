@@ -3,23 +3,22 @@ import datetime
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured, FieldError
-from django.core.urlresolvers import reverse, NoReverseMatch
-from django.http import HttpRequest, QueryDict
+from django.core.exceptions import FieldError
+from django.core.urlresolvers import reverse
+from django import forms
+from django.http import HttpRequest
 from django.test import TestCase
 from django.utils import dateformat
 from tastypie.authentication import BasicAuthentication
+from tastypie.authorization import Authorization
 from tastypie.bundle import Bundle
 from tastypie.exceptions import InvalidFilterError, InvalidSortError, ImmediateHttpResponse, BadRequest
 from tastypie import fields
 from tastypie.resources import Resource, ModelResource, ALL, ALL_WITH_RELATIONS
 from tastypie.serializers import Serializer
 from tastypie.throttle import CacheThrottle
+from tastypie.validation import Validation, FormValidation
 from core.models import Note, Subject
-try:
-    set
-except NameError:
-    from sets import Set as set
 try:
     import json
 except ImportError:
@@ -259,28 +258,78 @@ class ResourceTestCase(TestCase):
         basic = BasicResource()
         self.assertRaises(NotImplementedError, basic.obj_delete)
     
+    def test_rollback(self):
+        basic = BasicResource()
+        bundles_seen = []
+        self.assertRaises(NotImplementedError, basic.rollback, bundles_seen)
+    
     def test_build_schema(self):
         basic = BasicResource()
         self.assertEqual(basic.build_schema(), {
-            'view_count': {
-                'readonly': False,
-                'type': 'integer',
-                'nullable': False
+            'fields': {
+                'view_count': {
+                    'help_text': 'Integer data. Ex: 2673',
+                    'readonly': False,
+                    'type': 'integer',
+                    'nullable': False
+                },
+                'date_joined': {
+                    'help_text': 'A date & time as a string. Ex: "2010-11-10T03:07:43"',
+                    'readonly': False,
+                    'type': 'datetime',
+                    'nullable': True
+                },
+                'name': {
+                    'help_text': 'Unicode string data. Ex: "Hello World"',
+                    'readonly': False,
+                    'type': 'string',
+                    'nullable': False
+                },
+                'resource_uri': {
+                    'help_text': 'Unicode string data. Ex: "Hello World"',
+                    'readonly': True,
+                    'type': 'string',
+                    'nullable': False
+                }
             },
-            'date_joined': {
-                'readonly': False,
-                'type': 'datetime',
-                'nullable': True
+            'default_format': 'application/json'
+        })
+        
+        basic = BasicResource()
+        basic._meta.ordering = ['date_joined', 'name']
+        basic._meta.filtering = {'date_joined': ['gt', 'gte'], 'name': ALL}
+        self.assertEqual(basic.build_schema(), {
+            'fields': {
+                'view_count': {
+                    'help_text': 'Integer data. Ex: 2673',
+                    'readonly': False,
+                    'type': 'integer',
+                    'nullable': False
+                },
+                'date_joined': {
+                    'help_text': 'A date & time as a string. Ex: "2010-11-10T03:07:43"',
+                    'readonly': False,
+                    'type': 'datetime',
+                    'nullable': True
+                },
+                'name': {
+                    'help_text': 'Unicode string data. Ex: "Hello World"',
+                    'readonly': False,
+                    'type': 'string',
+                    'nullable': False
+                },
+                'resource_uri': {
+                    'help_text': 'Unicode string data. Ex: "Hello World"',
+                    'readonly': True,
+                    'type': 'string',
+                    'nullable': False
+                }
             },
-            'name': {
-                'readonly': False,
-                'type': 'string',
-                'nullable': False
-            },
-            'resource_uri': {
-                'readonly': True,
-                'type': 'string',
-                'nullable': False
+            'default_format': 'application/json',
+            'ordering': ['date_joined', 'name'],
+            'filtering': {
+                'date_joined': ['gt', 'gte'],
+                'name': ALL,
             }
         })
     
@@ -519,6 +568,31 @@ class NullableRelatedNoteResource(AnotherRelatedNoteResource):
     subjects = fields.ManyToManyField(SubjectResource, 'subjects', null=True)
 
 
+# Per user authorization bits.
+class PerUserAuthorization(Authorization):
+    def apply_limits(self, request, object_list):
+        if request and hasattr(request, 'user'):
+            if request.user.is_authenticated():
+                object_list = object_list.filter(author=request.user)
+            else:
+                object_list = object_list.none()
+        
+        return object_list
+
+
+class PerUserNoteResource(NoteResource):
+    class Meta:
+        resource_name = 'perusernotes'
+        queryset = Note.objects.all()
+        authorization = PerUserAuthorization()
+    
+    def apply_authorization_limits(self, request, object_list):
+        # Just to demonstrate the per-resource hooks.
+        object_list = super(PerUserNoteResource, self).apply_authorization_limits(request, object_list)
+        return object_list.filter(is_active=True)
+# End per user authorization bits.
+
+
 class ModelResourceTestCase(TestCase):
     fixtures = ['note_testdata.json']
     urls = 'core.tests.field_urls'
@@ -571,6 +645,21 @@ class ModelResourceTestCase(TestCase):
         # Note - automatic resource naming.
         resource_4 = NoUriNoteResource()
         self.assertEqual(resource_4._meta.resource_name, 'nourinote')
+        
+        # Test to make sure that, even with a mix of basic & advanced
+        # configuration, options are set right.
+        class TestOptionsResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+                allowed_methods = ['post']
+                list_allowed_methods = ['post', 'put']
+        
+        resource_5 = TestOptionsResource()
+        self.assertEqual(resource_5._meta.allowed_methods, ['post'])
+        # Should be the overridden values.
+        self.assertEqual(resource_5._meta.list_allowed_methods, ['post', 'put'])
+        # Should inherit from the basic configuration.
+        self.assertEqual(resource_5._meta.detail_allowed_methods, ['post'])
     
     def test_urls(self):
         # The common case, where the ``Api`` specifies the name.
@@ -1149,7 +1238,7 @@ class ModelResourceTestCase(TestCase):
         
         resp = resource.get_schema(request)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.content, '{"content": {"nullable": false, "readonly": false, "type": "string"}, "created": {"nullable": false, "readonly": false, "type": "datetime"}, "id": {"nullable": false, "readonly": false, "type": "string"}, "is_active": {"nullable": false, "readonly": false, "type": "boolean"}, "resource_uri": {"nullable": false, "readonly": true, "type": "string"}, "slug": {"nullable": false, "readonly": false, "type": "string"}, "title": {"nullable": false, "readonly": false, "type": "string"}, "updated": {"nullable": false, "readonly": false, "type": "datetime"}}')
+        self.assertEqual(resp.content, '{"default_format": "application/json", "fields": {"content": {"help_text": "Unicode string data. Ex: \\"Hello World\\"", "nullable": false, "readonly": false, "type": "string"}, "created": {"help_text": "A date & time as a string. Ex: \\"2010-11-10T03:07:43\\"", "nullable": false, "readonly": false, "type": "datetime"}, "id": {"help_text": "Unicode string data. Ex: \\"Hello World\\"", "nullable": false, "readonly": false, "type": "string"}, "is_active": {"help_text": "Boolean data. Ex: True", "nullable": false, "readonly": false, "type": "boolean"}, "resource_uri": {"help_text": "Unicode string data. Ex: \\"Hello World\\"", "nullable": false, "readonly": true, "type": "string"}, "slug": {"help_text": "Unicode string data. Ex: \\"Hello World\\"", "nullable": false, "readonly": false, "type": "string"}, "title": {"help_text": "Unicode string data. Ex: \\"Hello World\\"", "nullable": false, "readonly": false, "type": "string"}, "updated": {"help_text": "A date & time as a string. Ex: \\"2010-11-10T03:07:43\\"", "nullable": false, "readonly": false, "type": "datetime"}}, "filtering": {"content": ["startswith", "exact"], "slug": ["exact"], "title": 1}, "ordering": ["title", "slug", "resource_uri"]}')
     
     def test_get_multiple(self):
         resource = NoteResource()
@@ -1403,6 +1492,104 @@ class ModelResourceTestCase(TestCase):
         self.assertEqual(Note.objects.all().count(), 4)
         self.assertRaises(Note.DoesNotExist, Note.objects.get, slug='another-post')
     
+    def test_rollback(self):
+        self.assertEqual(Note.objects.all().count(), 6)
+        note = NoteResource()
+        
+        bundles_seen = []
+        note.rollback(bundles_seen)
+        self.assertEqual(Note.objects.all().count(), 6)
+        
+        # The one that exists should be deleted, the others ignored.
+        bundles_seen = [Bundle(obj=Note.objects.get(pk=1)), Bundle(obj=Note()), Bundle()]
+        note.rollback(bundles_seen)
+        self.assertEqual(Note.objects.all().count(), 5)
+    
+    def test_is_valid(self):
+        # Using the plug.
+        note = NoteResource()
+        bundle = Bundle(data={})
+        
+        try:
+            note.is_valid(bundle)
+        except:
+            self.fail("Stock 'is_valid' should pass without exception.")
+        
+        # An actual form.
+        class NoteForm(forms.Form):
+            title = forms.CharField(max_length=100)
+            slug = forms.CharField(max_length=50)
+            content = forms.CharField(required=False, widget=forms.Textarea)
+            is_active = forms.BooleanField()
+            
+            # Define a custom clean to make sure non-field errors are making it
+            # through.
+            def clean(self):
+                if not self.cleaned_data.get('content', ''):
+                    raise forms.ValidationError('Having no content makes for a very boring note.')
+                
+                return self.cleaned_data
+        
+        class ValidatedNoteResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+                resource_name = 'validated'
+                validation = FormValidation(form_class=NoteForm)
+        
+        class ValidatedXMLNoteResource(ModelResource):
+            class Meta:
+                queryset = Note.objects.all()
+                resource_name = 'validated'
+                validation = FormValidation(form_class=NoteForm)
+                default_format = 'application/xml'
+        
+        validated = ValidatedNoteResource()
+        validated_xml = ValidatedXMLNoteResource()
+        
+        # Test empty data.
+        bundle = Bundle(data={})
+        self.assertRaises(ImmediateHttpResponse, validated.is_valid, bundle)
+        
+        try:
+            validated.is_valid(bundle)
+            self.fail("This just passed above, but fails here? WRONG!")
+        except ImmediateHttpResponse, e:
+            self.assertEqual(e.response.content, '{"__all__": ["Having no content makes for a very boring note."], "is_active": ["This field is required."], "slug": ["This field is required."], "title": ["This field is required."]}')
+        
+        try:
+            validated_xml.is_valid(bundle)
+            self.fail("The XML variant is no different & is_valid should have still failed.")
+        except ImmediateHttpResponse, e:
+            self.assertEqual(e.response.content, '<?xml version=\'1.0\' encoding=\'utf-8\'?>\n<response><is_active type="list"><value>This field is required.</value></is_active><slug type="list"><value>This field is required.</value></slug><__all__ type="list"><value>Having no content makes for a very boring note.</value></__all__><title type="list"><value>This field is required.</value></title></response>')
+        
+        # Test something that fails validation.
+        bundle = Bundle(data={
+            'title': 123,
+            'slug': '123456789012345678901234567890123456789012345678901234567890',
+            'content': '',
+            'is_active': True,
+        })
+        self.assertRaises(ImmediateHttpResponse, validated.is_valid, bundle)
+        
+        try:
+            validated.is_valid(bundle)
+            self.fail("This just passed above, but fails here? WRONG AGAIN!")
+        except ImmediateHttpResponse, e:
+            self.assertEqual(e.response.content, '{"__all__": ["Having no content makes for a very boring note."], "slug": ["Ensure this value has at most 50 characters (it has 60)."]}')
+        
+        # Test something that passes validation.
+        bundle = Bundle(data={
+            'title': 'Test Content',
+            'slug': 'test-content',
+            'content': "It doesn't get any more awesome than this.",
+            'is_active': True,
+        })
+        
+        try:
+            validated.is_valid(bundle)
+        except ImmediateHttpResponse, e:
+            self.fail("Valid data was provided, yet still somehow errored. Why?")
+    
     def test_self_referential(self):
         class SelfResource(ModelResource):
             me_baby_me = fields.ToOneField('self', 'parent', null=True)
@@ -1414,7 +1601,8 @@ class ModelResourceTestCase(TestCase):
         me_baby_me = SelfResource()
         self.assertEqual(len(me_baby_me.fields), 9)
         self.assertEqual(me_baby_me._meta.resource_name, 'me_baby_me')
-        self.assertEqual(me_baby_me.fields['me_baby_me'].to, SelfResource)
+        self.assertEqual(me_baby_me.fields['me_baby_me'].to, 'self')
+        self.assertEqual(me_baby_me.fields['me_baby_me'].to_class, SelfResource)
         
         class AnotherSelfResource(SelfResource):
             class Meta:
@@ -1424,7 +1612,8 @@ class ModelResourceTestCase(TestCase):
         another_me_baby_me = AnotherSelfResource()
         self.assertEqual(len(another_me_baby_me.fields), 9)
         self.assertEqual(another_me_baby_me._meta.resource_name, 'another_me_baby_me')
-        self.assertEqual(another_me_baby_me.fields['me_baby_me'].to, AnotherSelfResource)
+        self.assertEqual(another_me_baby_me.fields['me_baby_me'].to, 'self')
+        self.assertEqual(another_me_baby_me.fields['me_baby_me'].to_class, AnotherSelfResource)
     
     def test_subclassing(self):
         class MiniResource(ModelResource):
@@ -1500,6 +1689,36 @@ class ModelResourceTestCase(TestCase):
         hydrated3 = nrrnr.obj_create(bundle_2)
         self.assertEqual(hydrated2.obj.author.username, u'johndoe')
         self.assertEqual(hydrated2.obj.subjects.count(), 0)
+    
+    def test_per_user_authorization(self):
+        from django.contrib.auth.models import AnonymousUser, User
+        
+        punr = PerUserNoteResource()
+        empty_request = type('MockRequest', (object,), {'GET': {}})
+        anony_request = type('MockRequest', (object,), {'user': AnonymousUser()})
+        authed_request = type('MockRequest', (object,), {'user': User.objects.get(username='johndoe')})
+        authed_request2 = type('MockRequest', (object,), {'user': User.objects.get(username='janedoe')})
+        
+        self.assertEqual(punr._meta.queryset.count(), 6)
+        
+        # Requests without a user get all active objects, regardless of author.
+        self.assertEqual(punr.get_object_list(empty_request).count(), 4)
+        self.assertEqual(punr.obj_get_list(request=empty_request).count(), 4)
+        
+        # Requests with an Anonymous user get no objects.
+        self.assertEqual(punr.get_object_list(anony_request).count(), 0)
+        self.assertEqual(punr.obj_get_list(request=anony_request).count(), 0)
+        
+        # Requests with an authenticated user get all objects for that user
+        # that are active.
+        self.assertEqual(punr.get_object_list(authed_request).count(), 2)
+        self.assertEqual(punr.obj_get_list(request=authed_request).count(), 2)
+        
+        # Demonstrate that a different user gets different objects.
+        self.assertEqual(punr.get_object_list(authed_request2).count(), 2)
+        self.assertEqual(punr.obj_get_list(request=authed_request2).count(), 2)
+        self.assertEqual(list(punr.get_object_list(authed_request).values_list('id', flat=True)), [1, 2])
+        self.assertEqual(list(punr.get_object_list(authed_request2).values_list('id', flat=True)), [4, 6])
 
 
 class BasicAuthResourceTestCase(TestCase):
