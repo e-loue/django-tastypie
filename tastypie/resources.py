@@ -570,7 +570,7 @@ class Resource(object):
             if method:
                 bundle.data[field_name] = method(bundle)
         
-        bundle = self.dehydrate(bundle)
+        bundle = self.dehydrate(bundle, request)
         return bundle
     
     def dehydrate(self, bundle, request=None):
