@@ -4,6 +4,7 @@ from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from django.core.urlresolvers import NoReverseMatch, reverse, resolve, Resolver404
 from django.db.models.sql.constants import QUERY_TERMS, LOOKUP_SEP
 from django.http import HttpResponse
+from django.utils.cache import patch_cache_control
 from tastypie.authentication import Authentication
 from tastypie.authorization import ReadOnlyAuthorization
 from tastypie.bundle import Bundle
@@ -97,17 +98,16 @@ class DeclarativeMetaclass(type):
             parents = [b for b in bases if issubclass(b, Resource)]
             
             for p in parents:
-                fields = getattr(p, 'base_fields', None)
+                fields = getattr(p, 'base_fields', {})
                 
-                if fields:
-                    attrs['base_fields'].update(fields)
+                for field_name, field_object in fields.items():
+                    attrs['base_fields'][field_name] = deepcopy(field_object)
         except NameError:
             pass
         
         for field_name, obj in attrs.items():
             if isinstance(obj, ApiField):
                 field = attrs.pop(field_name)
-                field.instance_name = field_name
                 declared_fields[field_name] = field
         
         attrs['base_fields'].update(declared_fields)
@@ -130,12 +130,8 @@ class DeclarativeMetaclass(type):
             del(new_class.base_fields['resource_uri'])
         
         for field_name, field_object in new_class.base_fields.items():
-            # Cover self-referential Resources.
-            # We can't do this quite like Django because there's no ``AppCache``
-            # here (which I think we should avoid as long as possible).
-            if isinstance(field_object, RelatedField):
-                if field_object.self_referential or field_object.to == 'self':
-                    field_object._to_class = new_class
+            if hasattr(field_object, 'contribute_to_class'):
+                field_object.contribute_to_class(new_class, field_name)
         
         return new_class
 
@@ -175,8 +171,18 @@ class Resource(object):
         @csrf_exempt
         def wrapper(request, *args, **kwargs):
             try:
-                return getattr(self, view)(request, *args, **kwargs)
-            except BadRequest, e:
+                callback = getattr(self, view)
+                response = callback(request, *args, **kwargs)
+                
+                
+                if request.is_ajax():
+                    # IE excessively caches XMLHttpRequests, so we're disabling
+                    # the browser cache here.
+                    # See http://www.enhanceie.com/ie/bugs.asp for details.
+                    patch_cache_control(response, no_cache=True)
+                
+                return response
+            except (BadRequest, ApiFieldError), e:
                 return HttpBadRequest(e.args[0])
             except Exception, e:
                 if hasattr(e, 'response'):
@@ -936,12 +942,7 @@ class Resource(object):
         bundles_seen = []
         
         for object_data in deserialized['objects']:
-            data = {}
-            
-            for key, value in object_data.items():
-                data[str(key)] = value
-            
-            bundle = self.build_bundle(data=data)
+            bundle = self.build_bundle(data=dict_strip_unicode_keys(object_data))
             
             # Attempt to be transactional, deleting any previously created
             # objects if validation fails.
@@ -988,12 +989,7 @@ class Resource(object):
         If a new resource is created, return ``HttpCreated`` (201 Created).
         """
         deserialized = self.deserialize(request, request.raw_post_data, format=request.META.get('CONTENT_TYPE', 'application/json'))
-        data = {}
-        
-        for key, value in deserialized.items():
-            data[str(key)] = value
-        
-        bundle = self.build_bundle(data=data)
+        bundle = self.build_bundle(data=dict_strip_unicode_keys(deserialized))
         self.is_valid(bundle, request)
         updated_bundle = self.obj_create(bundle, request=request)
         return HttpCreated(location=self.get_resource_uri(updated_bundle))

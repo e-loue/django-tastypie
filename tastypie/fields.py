@@ -5,6 +5,7 @@ from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 from django.utils import datetime_safe, importlib
 from tastypie.bundle import Bundle
 from tastypie.exceptions import ApiFieldError, NotFound
+from tastypie.utils import dict_strip_unicode_keys
 
 
 class NOT_PROVIDED:
@@ -51,6 +52,7 @@ class ApiField(object):
         """
         # Track what the index thinks this field is called.
         self.instance_name = None
+        self._resource = None
         self.attribute = attribute
         self._default = default
         self.null = null
@@ -60,6 +62,12 @@ class ApiField(object):
         
         if help_text:
             self.help_text = help_text
+    
+    def contribute_to_class(self, cls, name):
+        # Do the least we can here so that we don't hate ourselves in the
+        # morning.
+        self.instance_name = name
+        self._resource = cls
     
     def has_default(self):
         """Returns a boolean of whether this field has a default value."""
@@ -370,6 +378,7 @@ class RelatedField(ApiField):
         ``dehydrate`` will be included in full.
         """
         self.instance_name = None
+        self._resource = None
         self.to = to
         self.attribute = attribute
         self.related_name = related_name
@@ -387,6 +396,15 @@ class RelatedField(ApiField):
         
         if help_text:
             self.help_text = help_text
+    
+    def contribute_to_class(self, cls, name):
+        super(RelatedField, self).contribute_to_class(cls, name)
+        
+        # Check if we're self-referential and hook it up.
+        # We can't do this quite like Django because there's no ``AppCache``
+        # here (which I think we should avoid as long as possible).
+        if self.self_referential or self.to == 'self':
+            self._to_class = cls
     
     def has_default(self):
         """
@@ -407,6 +425,12 @@ class RelatedField(ApiField):
         Instaniates the related resource.
         """
         related_resource = self.to_class()
+        
+        # Fix the ``api_name`` if it's not present.
+        if related_resource._meta.api_name is None:
+            if self._resource and not self._resource._meta.api_name is None:
+                related_resource._meta.api_name = self._resource._meta.api_name
+        
         # Try to be efficient about DB queries.
         related_resource.instance = related_instance
         return related_resource
@@ -471,6 +495,7 @@ class RelatedField(ApiField):
                 raise ApiFieldError("Could not find the provided object via resource URI '%s'." % value)
         elif hasattr(value, 'items'):
             # Try to hydrate the data provided.
+            value = dict_strip_unicode_keys(value)
             self.fk_bundle = Bundle(data=value)
             try:
                 return self.fk_resource.obj_update(self.fk_bundle, **value)
